@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.16)
+project(HPC_Adaptive_RGC LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(OpenMP)
+
+add_library(argcsr
+    src/csr/csr_matrix.cpp
+    src/csr/csr_spmv.cpp
+    src/argcsr/argcsr_grouping.cpp
+    src/argcsr/argcsr_chunking.cpp
+    src/argcsr/argcsr_mapping.cpp
+    src/argcsr/argcsr_conversion.cpp
+)
+target_include_directories(argcsr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(adaptive_rgc src/main.cpp)
+target_link_libraries(adaptive_rgc PRIVATE argcsr)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(adaptive_rgc PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(adaptive_rgc PRIVATE ADAPTIVE_RGC_HAS_OPENMP=1)
+endif()
+
+enable_testing()
+add_executable(test_csr tests/test_csr.cpp)
+target_link_libraries(test_csr PRIVATE argcsr)
+add_test(NAME csr_foundation COMMAND test_csr)
+add_executable(test_argcsr tests/test_argcsr.cpp)
+target_link_libraries(test_argcsr PRIVATE argcsr)
+add_test(NAME argcsr_conversion COMMAND test_argcsr)
