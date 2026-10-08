@@ -15,6 +15,7 @@ add_library(argcsr
     src/argcsr/argcsr_mapping.cpp
     src/argcsr/argcsr_conversion.cpp
     src/argcsr/argcsr_spmv.cpp
+    src/validation/argcsr_validation.cpp
 )
 target_include_directories(argcsr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -35,3 +36,6 @@ add_test(NAME argcsr_conversion COMMAND test_argcsr)
 add_executable(test_argcsr_spmv tests/test_argcsr_spmv.cpp)
 target_link_libraries(test_argcsr_spmv PRIVATE argcsr)
 add_test(NAME argcsr_spmv COMMAND test_argcsr_spmv)
+add_executable(test_argcsr_random tests/test_argcsr_random.cpp)
+target_link_libraries(test_argcsr_random PRIVATE argcsr)
+add_test(NAME argcsr_random COMMAND test_argcsr_random)

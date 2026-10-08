@@ -1,2 +1,8 @@
 To compile test_argcsr_spmv
 g++ -std=c++17 tests/test_argcsr_spmv.cpp src/csr/csr_matrix.cpp src/csr/csr_spmv.cpp src/argcsr/argcsr_chunking.cpp src/argcsr/argcsr_conversion.cpp src/argcsr/argcsr_grouping.cpp src/argcsr/argcsr_mapping.cpp src/argcsr/argcsr_spmv.cpp -Iinclude -o tests/test_argcsr_spmv.exe
+
+cmake -S . -B build
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+
+to run: ./build/exe file name 
