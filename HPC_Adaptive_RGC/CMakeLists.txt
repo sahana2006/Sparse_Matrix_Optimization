@@ -31,6 +31,9 @@ add_executable(generate_matrices benchmarks/generate_matrices.cpp)
 add_executable(sequential_benchmark benchmarks/sequential_benchmark.cpp)
 target_link_libraries(sequential_benchmark PRIVATE argcsr)
 
+add_executable(conversion_profile benchmarks/conversion_profile.cpp)
+target_link_libraries(conversion_profile PRIVATE argcsr)
+
 enable_testing()
 add_executable(test_csr tests/test_csr.cpp)
 target_link_libraries(test_csr PRIVATE argcsr)

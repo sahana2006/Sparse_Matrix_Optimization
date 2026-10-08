@@ -1,29 +1,44 @@
 #include "argcsr/argcsr_types.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace argcsr {
 std::vector<int> calculateThreadMapping(const CSRMatrix&, const ArgCSRGroupInfo&, int);
 int calculateChunkSize(const CSRMatrix&, const ArgCSRGroupInfo&, const std::vector<int>&);
 
-ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blockSize) {
+ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blockSize,
+                             ConversionTimings* timings) {
+    using Clock = std::chrono::steady_clock;
+    if (timings) *timings = {};
+    const auto groupingStart = Clock::now();
+    auto groups = buildGroups(csr, desiredChunkSize, blockSize);
+    const auto groupingStop = Clock::now();
+    if (timings) timings->grouping = groupingStop - groupingStart;
     
     // Construct the output matrix with the same dimensions and non-zero count as the input CSR matrix, along with the specified block size and desired chunk size.
     // {} {} {} => values, columns, threadsMapping.
     ArgCSRMatrix out{csr.rows, csr.cols, csr.nnz, blockSize, desiredChunkSize,
-                     buildGroups(csr, desiredChunkSize, blockSize), {}, {}, {}};
+                     std::move(groups), {}, {}, {}};
     
     // Stores prefixes for each group
     std::vector<std::vector<int>> prefixes;
     long long totalSize = 0; // Total size of the output matrix
     
     for (auto& group : out.groups) {
+        const auto mappingStart = Clock::now();
         const auto mapping = calculateThreadMapping(csr, group, blockSize);
         const auto prefix = exclusivePrefixSum(mapping); // calculate prefix from the mappings obtained
+        const auto mappingStop = Clock::now();
+        if (timings) timings->mapping += mappingStop - mappingStart;
+        const auto chunkingStart = Clock::now();
         group.chunkSize = calculateChunkSize(csr, group, mapping);
+        const auto chunkingStop = Clock::now();
+        if (timings) timings->chunking += chunkingStop - chunkingStart;
         
         if (totalSize > std::numeric_limits<int>::max()) throw std::overflow_error("ArgCSR storage offset exceeds int range");
         
@@ -37,6 +52,7 @@ ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blo
     
     }
 
+    const auto storageStart = Clock::now();
     out.values.assign(static_cast<std::size_t>(totalSize), 0.0); // size of the array is totalsize
     out.columns.assign(static_cast<std::size_t>(totalSize), -1);
     
@@ -64,6 +80,8 @@ ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blo
             }
         }
     }
+    const auto storageStop = Clock::now();
+    if (timings) timings->storage = storageStop - storageStart;
     
     // Structural and ownership-preserving validation: scan each row's assigned chunks
     // and compare its ordered (value,column) sequence with the source CSR row.

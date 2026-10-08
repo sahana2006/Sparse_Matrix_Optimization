@@ -3,6 +3,7 @@
 #include "csr/csr_matrix.hpp"
 
 #include <vector>
+#include <chrono>
 
 namespace argcsr {
 // Each group has set a 4 tuple information
@@ -25,9 +26,17 @@ struct ArgCSRMatrix {
     std::vector<int> threadsMapping; // Mapping of threads to groups
 };
 
+struct ConversionTimings {
+    std::chrono::steady_clock::duration grouping{};
+    std::chrono::steady_clock::duration chunking{};
+    std::chrono::steady_clock::duration mapping{};
+    std::chrono::steady_clock::duration storage{};
+};
+
 std::vector<ArgCSRGroupInfo> buildGroups(const CSRMatrix& csr, int desiredChunkSize, int blockSize);
 std::vector<int> exclusivePrefixSum(const std::vector<int>& values);
-ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blockSize);
+ArgCSRMatrix convertToArgCSR(const CSRMatrix& csr, int desiredChunkSize, int blockSize,
+                             ConversionTimings* timings = nullptr);
 void printArgCSR(const ArgCSRMatrix& matrix);
 
 }  // namespace argcsr
