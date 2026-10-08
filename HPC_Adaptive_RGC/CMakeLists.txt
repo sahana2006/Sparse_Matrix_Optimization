@@ -14,6 +14,7 @@ add_library(argcsr
     src/argcsr/argcsr_chunking.cpp
     src/argcsr/argcsr_mapping.cpp
     src/argcsr/argcsr_conversion.cpp
+    src/argcsr/argcsr_spmv.cpp
 )
 target_include_directories(argcsr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -31,3 +32,6 @@ add_test(NAME csr_foundation COMMAND test_csr)
 add_executable(test_argcsr tests/test_argcsr.cpp)
 target_link_libraries(test_argcsr PRIVATE argcsr)
 add_test(NAME argcsr_conversion COMMAND test_argcsr)
+add_executable(test_argcsr_spmv tests/test_argcsr_spmv.cpp)
+target_link_libraries(test_argcsr_spmv PRIVATE argcsr)
+add_test(NAME argcsr_spmv COMMAND test_argcsr_spmv)
