@@ -6,3 +6,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 to run: ./build/exe file name 
+
+generate_matrices.cpp
+cmake --build build --target generate_matrices
+.\build\generate_matrices.exe
