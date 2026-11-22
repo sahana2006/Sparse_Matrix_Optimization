@@ -80,6 +80,25 @@ if(ENABLE_CUDA)
         LINKER_LANGUAGE CUDA
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
+
+    add_library(argcsr_cuda_streams src/cuda/argcsr_cuda_streams.cu)
+    target_include_directories(argcsr_cuda_streams PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(argcsr_cuda_streams PUBLIC argcsr_cuda CUDA::cudart)
+    set_property(TARGET argcsr_cuda_streams PROPERTY CUDA_ARCHITECTURES 120)
+
+    add_executable(test_argcsr_cuda_streams tests/test_argcsr_cuda_streams.cpp)
+    target_link_libraries(test_argcsr_cuda_streams PRIVATE argcsr_cuda_streams)
+    add_test(NAME argcsr_cuda_streams COMMAND test_argcsr_cuda_streams)
+    set_tests_properties(argcsr_cuda_streams PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(cuda_pipeline_streams_benchmark benchmarks/cuda_pipeline_streams_benchmark.cpp)
+    target_link_libraries(cuda_pipeline_streams_benchmark PRIVATE argcsr_cuda_streams)
+    set_target_properties(cuda_pipeline_streams_benchmark PROPERTIES
+        LINKER_LANGUAGE CUDA
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
 endif()
 
 add_executable(test_csr tests/test_csr.cpp)
