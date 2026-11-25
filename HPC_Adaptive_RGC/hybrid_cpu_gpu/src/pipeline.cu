@@ -35,6 +35,21 @@ public:
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            release();
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+
     void allocate(std::size_t count) {
         if (ptr_) throw std::logic_error("device buffer already allocated");
         if (count == 0) return;
@@ -191,7 +206,7 @@ UploadedState upload(const OpenMPConversionResult& converted, const std::vector<
     xfer.h2dBytes = countH2DBytes(converted, x);
     xfer.h2dMs = h2d;
     xfer.h2dBandwidthGbps = gigaBytesPerSecond(xfer.h2dBytes, xfer.h2dMs);
-  return state;
+    return std::move(state);
 }
 
 }  // namespace
@@ -213,9 +228,9 @@ PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
     if (x.size() != static_cast<std::size_t>(csr.cols)) {
         throw std::invalid_argument("input vector length must equal matrix columns");
     }
-  if (config.cudaBlockSize <= 0 || config.cudaBlockSize > 1024) {
-    throw std::invalid_argument("cudaBlockSize must be in [1, 1024]");
-  }
+    if (config.cudaBlockSize <= 0 || config.cudaBlockSize > 1024) {
+        throw std::invalid_argument("cudaBlockSize must be in [1, 1024]");
+    }
 
     const auto wallStart = Clock::now();
     PipelineResult result;
