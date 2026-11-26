@@ -7,13 +7,14 @@
 #include <chrono>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace hybrid_cpu_gpu {
-namespace {
+namespace detail {
 
 using Clock = std::chrono::steady_clock;
 
@@ -50,11 +51,17 @@ public:
         return *this;
     }
 
-    void allocate(std::size_t count) {
-        if (ptr_) throw std::logic_error("device buffer already allocated");
-        if (count == 0) return;
+    /** Returns true if a new cudaMalloc happened. */
+    bool ensureSize(std::size_t count) {
+        if (count == 0) {
+            release();
+            return false;
+        }
+        if (ptr_ && count_ == count) return false;
+        release();
         checkCuda(cudaMalloc(reinterpret_cast<void**>(&ptr_), count * sizeof(T)), "cudaMalloc");
         count_ = count;
+        return true;
     }
 
     void release() noexcept {
@@ -179,20 +186,23 @@ struct UploadedState {
     DeviceBuffer<double> y;
 };
 
-UploadedState upload(const OpenMPConversionResult& converted, const std::vector<double>& x,
-                     TransferMetrics& xfer) {
+void ensureAndUpload(UploadedState& state,
+                     const OpenMPConversionResult& converted,
+                     const std::vector<double>& x,
+                     TransferMetrics& xfer,
+                     double& allocMs) {
     const auto& m = converted.matrix;
-    UploadedState state;
     const auto allocStart = Clock::now();
-    state.groups.allocate(m.groups.size());
-    state.values.allocate(m.values.size());
-    state.columns.allocate(m.columns.size());
-    state.mapping.allocate(static_cast<std::size_t>(m.rows));
-    state.rowGroup.allocate(converted.rowGroup.size());
-    state.rowPrefix.allocate(converted.rowPrefix.size());
-    state.x.allocate(x.size());
-    state.y.allocate(static_cast<std::size_t>(m.rows));
-    (void)allocStart;
+    bool allocated = false;
+    allocated |= state.groups.ensureSize(m.groups.size());
+    allocated |= state.values.ensureSize(m.values.size());
+    allocated |= state.columns.ensureSize(m.columns.size());
+    allocated |= state.mapping.ensureSize(m.threadsMapping.size());
+    allocated |= state.rowGroup.ensureSize(converted.rowGroup.size());
+    allocated |= state.rowPrefix.ensureSize(converted.rowPrefix.size());
+    allocated |= state.x.ensureSize(x.size());
+    allocated |= state.y.ensureSize(static_cast<std::size_t>(m.rows));
+    allocMs = allocated ? elapsedMs(allocStart, Clock::now()) : 0.0;
 
     double h2d = 0.0;
     h2d += copyH2D(state.groups.get(), m.groups.data(), m.groups.size());
@@ -206,10 +216,39 @@ UploadedState upload(const OpenMPConversionResult& converted, const std::vector<
     xfer.h2dBytes = countH2DBytes(converted, x);
     xfer.h2dMs = h2d;
     xfer.h2dBandwidthGbps = gigaBytesPerSecond(xfer.h2dBytes, xfer.h2dMs);
-    return std::move(state);
 }
 
-}  // namespace
+void runKernelAndD2h(UploadedState& device,
+                     const argcsr::ArgCSRMatrix& mat,
+                     const PipelineConfig& config,
+                     PipelineResult& result) {
+    result.timings.kernelMs = launchTimedKernel(
+        mat.rows, mat.blockSize, config.cudaBlockSize, device.groups.get(), device.values.get(),
+        device.columns.get(), device.mapping.get(), device.rowGroup.get(), device.rowPrefix.get(),
+        device.x.get(), device.y.get());
+
+    result.output.resize(static_cast<std::size_t>(mat.rows));
+    const double d2h = copyD2H(result.output.data(), device.y.get(), result.output.size());
+    result.timings.transfer.d2hMs = d2h;
+    result.timings.transfer.d2hBytes = result.output.size() * sizeof(double);
+    result.timings.transfer.d2hBandwidthGbps =
+        gigaBytesPerSecond(result.timings.transfer.d2hBytes, d2h);
+}
+
+}  // namespace detail
+
+struct PipelineDeviceCache::Storage {
+    detail::UploadedState device;
+};
+
+PipelineDeviceCache::PipelineDeviceCache() = default;
+PipelineDeviceCache::~PipelineDeviceCache() = default;
+PipelineDeviceCache::PipelineDeviceCache(PipelineDeviceCache&&) noexcept = default;
+PipelineDeviceCache& PipelineDeviceCache::operator=(PipelineDeviceCache&&) noexcept = default;
+
+void PipelineDeviceCache::clear() {
+    if (storage_) storage_->device = detail::UploadedState{};
+}
 
 bool cudaDeviceAvailable() {
     int count = 0;
@@ -221,7 +260,8 @@ PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
                                  int desiredChunkSize,
                                  int blockSize,
                                  const PipelineConfig& config,
-                                 bool keepRepresentation) {
+                                 bool keepRepresentation,
+                                 PipelineDeviceCache* deviceCache) {
     if (!cudaDeviceAvailable()) {
         throw std::runtime_error("CUDA device required for hybrid pipeline");
     }
@@ -232,7 +272,7 @@ PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
         throw std::invalid_argument("cudaBlockSize must be in [1, 1024]");
     }
 
-    const auto wallStart = Clock::now();
+    const auto wallStart = detail::Clock::now();
     PipelineResult result;
 
     OpenMPConversionResult converted =
@@ -240,25 +280,23 @@ PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
     result.timings.ompConversion = converted.timings;
 
     const auto& mat = converted.matrix;
-    const auto allocStart = Clock::now();
-    UploadedState device = upload(converted, x, result.timings.transfer);
-    result.timings.deviceAllocMs = elapsedMs(allocStart, Clock::now());
+    double allocMs = 0.0;
 
-    result.timings.kernelMs = launchTimedKernel(
-        mat.rows, mat.blockSize, config.cudaBlockSize, device.groups.get(), device.values.get(),
-        device.columns.get(), device.mapping.get(), device.rowGroup.get(), device.rowPrefix.get(),
-        device.x.get(), device.y.get());
+    if (deviceCache) {
+        if (!deviceCache->storage_)
+            deviceCache->storage_ = std::make_unique<PipelineDeviceCache::Storage>();
+        detail::ensureAndUpload(deviceCache->storage_->device, converted, x, result.timings.transfer,
+                                allocMs);
+        result.timings.deviceAllocMs = allocMs;
+        detail::runKernelAndD2h(deviceCache->storage_->device, mat, config, result);
+    } else {
+        detail::UploadedState device;
+        detail::ensureAndUpload(device, converted, x, result.timings.transfer, allocMs);
+        result.timings.deviceAllocMs = allocMs;
+        detail::runKernelAndD2h(device, mat, config, result);
+    }
 
-    result.output.resize(static_cast<std::size_t>(mat.rows));
-    const auto d2hStart = Clock::now();
-    const double d2h = copyD2H(result.output.data(), device.y.get(), result.output.size());
-    result.timings.transfer.d2hMs = d2h;
-    result.timings.transfer.d2hBytes = result.output.size() * sizeof(double);
-    result.timings.transfer.d2hBandwidthGbps =
-        gigaBytesPerSecond(result.timings.transfer.d2hBytes, d2h);
-    (void)d2hStart;
-
-    result.timings.totalMs = elapsedMs(wallStart, Clock::now());
+    result.timings.totalMs = detail::elapsedMs(wallStart, detail::Clock::now());
     if (keepRepresentation) {
         result.representation = std::move(converted.matrix);
     }
@@ -273,18 +311,17 @@ double benchmarkHybridKernelOnly(const OpenMPConversionResult& converted,
                                  TransferMetrics* transfer) {
     TransferMetrics local{};
     TransferMetrics& xfer = transfer ? *transfer : local;
-    UploadedState device = upload(converted, x, xfer);
+    detail::UploadedState device;
+    double allocMs = 0.0;
+    detail::ensureAndUpload(device, converted, x, xfer, allocMs);
+    (void)allocMs;
     const auto& mat = converted.matrix;
-    (void)launchTimedKernel(mat.rows, mat.blockSize, cudaBlockSize, device.groups.get(),
-                            device.values.get(), device.columns.get(), device.mapping.get(),
-                            device.rowGroup.get(), device.rowPrefix.get(), device.x.get(),
-                            device.y.get());
-    kernelMs = launchTimedKernel(mat.rows, mat.blockSize, cudaBlockSize, device.groups.get(),
-                                 device.values.get(), device.columns.get(), device.mapping.get(),
-                                 device.rowGroup.get(), device.rowPrefix.get(), device.x.get(),
-                                 device.y.get());
+    kernelMs = detail::launchTimedKernel(mat.rows, mat.blockSize, cudaBlockSize, device.groups.get(),
+                                         device.values.get(), device.columns.get(), device.mapping.get(),
+                                         device.rowGroup.get(), device.rowPrefix.get(), device.x.get(),
+                                         device.y.get());
     output.resize(static_cast<std::size_t>(mat.rows));
-    xfer.d2hMs = copyD2H(output.data(), device.y.get(), output.size());
+    xfer.d2hMs = detail::copyD2H(output.data(), device.y.get(), output.size());
     xfer.d2hBytes = output.size() * sizeof(double);
     xfer.d2hBandwidthGbps = gigaBytesPerSecond(xfer.d2hBytes, xfer.d2hMs);
     return kernelMs;
