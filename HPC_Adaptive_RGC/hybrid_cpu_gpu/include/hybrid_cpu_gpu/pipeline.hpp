@@ -4,21 +4,38 @@
 
 #include "csr/csr_matrix.hpp"
 
+#include <memory>
 #include <vector>
 
 namespace hybrid_cpu_gpu {
 
+struct PipelineDeviceCache {
+    struct Storage;
+
+    PipelineDeviceCache();
+    ~PipelineDeviceCache();
+    PipelineDeviceCache(PipelineDeviceCache&&) noexcept;
+    PipelineDeviceCache& operator=(PipelineDeviceCache&&) noexcept;
+    PipelineDeviceCache(const PipelineDeviceCache&) = delete;
+    PipelineDeviceCache& operator=(const PipelineDeviceCache&) = delete;
+
+    void clear();
+
+    std::unique_ptr<Storage> storage_;
+};
+
 bool cudaDeviceAvailable();
 
 // End-to-end: OpenMP conversion -> H2D -> CUDA ArgCSR SpMV -> D2H.
+// Pass deviceCache to reuse GPU allocations across repeated calls (same matrix sizes).
 PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
                                  const std::vector<double>& x,
                                  int desiredChunkSize,
                                  int blockSize,
                                  const PipelineConfig& config = {},
-                                 bool keepRepresentation = false);
+                                 bool keepRepresentation = false,
+                                 PipelineDeviceCache* deviceCache = nullptr);
 
-// Amortized SpMV timing on an already-converted matrix (after warm-up upload).
 double benchmarkHybridKernelOnly(const OpenMPConversionResult& converted,
                                  const std::vector<double>& x,
                                  int cudaBlockSize,
