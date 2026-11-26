@@ -26,8 +26,6 @@ struct PipelineDeviceCache {
 
 bool cudaDeviceAvailable();
 
-// End-to-end: OpenMP conversion -> H2D -> CUDA ArgCSR SpMV -> D2H.
-// Pass deviceCache to reuse GPU allocations across repeated calls (same matrix sizes).
 PipelineResult runHybridPipeline(const argcsr::CSRMatrix& csr,
                                  const std::vector<double>& x,
                                  int desiredChunkSize,
