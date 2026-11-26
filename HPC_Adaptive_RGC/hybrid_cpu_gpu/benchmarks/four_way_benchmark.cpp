@@ -25,6 +25,7 @@ constexpr int kDesired = 2;
 constexpr int kBlock = 4;
 constexpr int kConversionRuns = 3;
 constexpr int kSpmvRuns = 5;
+constexpr int kWarmupRuns = 2;
 using Clock = std::chrono::steady_clock;
 
 double ms(Clock::duration d) {
@@ -65,6 +66,8 @@ struct Row {
     std::string matrix;
     int ompThreads;
     double sequentialMs;
+    double seqConvertMs;
+    double seqSpmvMs;
     double openmpConvertMs;
     double cudaPipelineMs;
     double hybridTotalMs;
@@ -74,6 +77,8 @@ struct Row {
     double speedupHybridVsSeq;
     double speedupCudaVsSeq;
     double speedupHybridVsCuda;
+    double speedupOmpConvertVsSeqConvert;
+    double speedupHybridKernelVsSeqSpmv;
 };
 
 }  // namespace
@@ -102,13 +107,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const std::filesystem::path outCsv =
-        "hybrid_cpu_gpu/benchmarks/results/four_way_comparison.csv";
-    std::filesystem::create_directories(outCsv.parent_path());
+    const std::filesystem::path outDir = "hybrid_cpu_gpu/benchmarks/results";
+    std::filesystem::create_directories(outDir);
+    const std::filesystem::path outCsv = outDir / "four_way_comparison.csv";
+    const std::filesystem::path diagCsv = outDir / "end_to_end_diagnosis.csv";
+    const std::filesystem::path scaleCsv = outDir / "omp_thread_scaling.csv";
     std::ofstream csv(outCsv);
-    csv << "matrix,omp_threads,sequential_total_ms,openmp_convert_ms,cuda_pipeline_ms,"
-           "hybrid_total_ms,hybrid_kernel_ms,hybrid_h2d_gbps,hybrid_d2h_gbps,"
-           "speedup_hybrid_vs_seq,speedup_cuda_vs_seq,speedup_hybrid_vs_cuda\n";
+    std::ofstream diag(diagCsv);
+    csv << "matrix,omp_threads,sequential_total_ms,seq_convert_ms,seq_spmv_ms,openmp_convert_ms,"
+           "cuda_pipeline_ms,hybrid_total_ms,hybrid_kernel_ms,hybrid_h2d_gbps,hybrid_d2h_gbps,"
+           "speedup_hybrid_vs_seq,speedup_cuda_vs_seq,speedup_hybrid_vs_cuda,"
+           "speedup_omp_convert_vs_seq_convert,speedup_hybrid_kernel_vs_seq_spmv\n";
+    diag << "matrix,rows,nnz,storage_elements,pad_ratio,"
+            "seq_convert_ms,seq_spmv_ms,sequential_total_ms,"
+            "omp_convert_ms,grouping_ms,mapping_chunk_wall_ms,mapping_sum_ms,"
+            "offset_assign_ms,scatter_ms,metadata_ms,convert_accounted_ms,convert_hidden_ms,"
+            "assign_gbs,scatter_useful_gbs,h2d_bytes,h2d_ms,h2d_gbs,d2h_ms,kernel_ms,"
+            "device_alloc_ms,hybrid_inner_total_ms,hybrid_outer_median_ms,"
+            "hybrid_accounted_ms,hybrid_unexplained_ms,speedup_hybrid_vs_seq\n";
 
     try {
         for (const std::string& name : names) {
@@ -128,16 +144,22 @@ int main(int argc, char** argv) {
                 (void)argcsr::argcsr_spmv(rep, x);
                 seqSpmv.push_back(ms(Clock::now() - t0));
             }
-            const double sequentialMs = median(seqConv) + median(seqSpmv);
+            const double seqConvertMs = median(seqConv);
+            const double seqSpmvMs = median(seqSpmv);
+            const double sequentialMs = seqConvertMs + seqSpmvMs;
 
             std::vector<double> ompConv;
+            hybrid_cpu_gpu::OpenMPConversionResult lastOmp{};
             for (int i = 0; i < kConversionRuns; ++i) {
                 const auto t0 = Clock::now();
-                (void)hybrid_cpu_gpu::convertCsrToArgCsrOpenMP(csr, kDesired, kBlock, ompThreads);
+                lastOmp = hybrid_cpu_gpu::convertCsrToArgCsrOpenMP(csr, kDesired, kBlock, ompThreads);
                 ompConv.push_back(ms(Clock::now() - t0));
             }
             const double openmpMs = median(ompConv);
 
+            for (int w = 0; w < kWarmupRuns; ++w) {
+                (void)argcsr::runArgCsrCudaPipeline(csr, x, kDesired, kBlock, false);
+            }
             std::vector<double> cudaSamples;
             for (int i = 0; i < kSpmvRuns; ++i) {
                 const auto t0 = Clock::now();
@@ -147,20 +169,32 @@ int main(int argc, char** argv) {
             const double cudaMs = median(cudaSamples);
 
             hybrid_cpu_gpu::PipelineConfig cfg{ompThreads, 256, false};
+            hybrid_cpu_gpu::PipelineDeviceCache deviceCache;
+            for (int w = 0; w < kWarmupRuns; ++w) {
+                (void)hybrid_cpu_gpu::runHybridPipeline(csr, x, kDesired, kBlock, cfg, false, &deviceCache);
+            }
             std::vector<double> hybridSamples;
             hybrid_cpu_gpu::PipelineTimingsMs last{};
             for (int i = 0; i < kSpmvRuns; ++i) {
                 const auto t0 = Clock::now();
-                const auto h = hybrid_cpu_gpu::runHybridPipeline(csr, x, kDesired, kBlock, cfg, false);
+                const auto h = hybrid_cpu_gpu::runHybridPipeline(csr, x, kDesired, kBlock, cfg, false,
+                                                                 &deviceCache);
                 hybridSamples.push_back(ms(Clock::now() - t0));
                 last = h.timings;
             }
             const double hybridMs = median(hybridSamples);
             const auto speed = hybrid_cpu_gpu::computeSpeedups(sequentialMs, hybridMs, cudaMs);
 
+            const double speedOmpConv =
+                openmpMs > 0.0 ? seqConvertMs / openmpMs : 0.0;
+            const double speedKernel =
+                last.kernelMs > 0.0 ? seqSpmvMs / last.kernelMs : 0.0;
+
             Row r{name,
                   ompThreads,
                   sequentialMs,
+                  seqConvertMs,
+                  seqSpmvMs,
                   openmpMs,
                   cudaMs,
                   hybridMs,
@@ -169,16 +203,80 @@ int main(int argc, char** argv) {
                   last.transfer.d2hBandwidthGbps,
                   speed.hybridVsSequential,
                   speed.cudaVsSequential,
-                  speed.hybridVsCuda};
+                  speed.hybridVsCuda,
+                  speedOmpConv,
+                  speedKernel};
             csv << r.matrix << ',' << r.ompThreads << ',' << std::setprecision(10) << r.sequentialMs
-                << ',' << r.openmpConvertMs << ',' << r.cudaPipelineMs << ',' << r.hybridTotalMs << ','
-                << r.hybridKernelMs << ',' << r.hybridH2dGbps << ',' << r.hybridD2hGbps << ','
-                << r.speedupHybridVsSeq << ',' << r.speedupCudaVsSeq << ',' << r.speedupHybridVsCuda
-                << '\n';
+                << ',' << r.seqConvertMs << ',' << r.seqSpmvMs << ',' << r.openmpConvertMs << ','
+                << r.cudaPipelineMs << ',' << r.hybridTotalMs << ',' << r.hybridKernelMs << ','
+                << r.hybridH2dGbps << ',' << r.hybridD2hGbps << ',' << r.speedupHybridVsSeq << ','
+                << r.speedupCudaVsSeq << ',' << r.speedupHybridVsCuda << ',' << r.speedupOmpConvertVsSeqConvert
+                << ',' << r.speedupHybridKernelVsSeqSpmv << '\n';
+            const auto& conv = last.ompConversion.storageElements ? last.ompConversion : lastOmp.timings;
+            const double grouping = conv.groupingMs;
+            const double mapWall = conv.mappingChunkWallMs;
+            const double assignMs = conv.offsetAssignMs;
+            const double scatterMs = conv.storageMs;
+            const double metaMs = conv.metadataMs;
+            const double convertAccounted = grouping + mapWall + assignMs + scatterMs + metaMs;
+            const double convertHidden = conv.totalMs - convertAccounted;
+            const std::size_t storage = conv.storageElements;
+            const std::size_t nnz = conv.nnz ? conv.nnz : static_cast<std::size_t>(csr.nnz);
+            const double pad = nnz ? static_cast<double>(storage) / static_cast<double>(nnz) : 0.0;
+            const std::size_t assignBytes = storage * (sizeof(double) + sizeof(int));
+            const std::size_t scatterBytes = nnz * (sizeof(double) + sizeof(int));
+            const double assignGbs = hybrid_cpu_gpu::gigaBytesPerSecond(assignBytes, assignMs);
+            const double scatterGbs = hybrid_cpu_gpu::gigaBytesPerSecond(scatterBytes, scatterMs);
+            const double hybridAccounted = last.ompConversion.totalMs + last.deviceAllocMs +
+                                           last.transfer.h2dMs + last.kernelMs + last.transfer.d2hMs;
+            const double hybridUnexplained = last.totalMs - hybridAccounted;
+
+            diag << name << ',' << csr.rows << ',' << nnz << ',' << storage << ','
+                 << std::setprecision(10) << pad << ',' << seqConvertMs << ',' << seqSpmvMs << ','
+                 << sequentialMs << ',' << openmpMs << ',' << grouping << ',' << mapWall << ','
+                 << conv.mappingMs << ',' << assignMs << ',' << scatterMs << ',' << metaMs << ','
+                 << convertAccounted << ',' << convertHidden << ',' << assignGbs << ',' << scatterGbs
+                 << ',' << last.transfer.h2dBytes << ',' << last.transfer.h2dMs << ','
+                 << last.transfer.h2dBandwidthGbps << ',' << last.transfer.d2hMs << ',' << last.kernelMs
+                 << ',' << last.deviceAllocMs << ',' << last.totalMs << ',' << hybridMs << ','
+                 << hybridAccounted << ',' << hybridUnexplained << ',' << speed.hybridVsSequential
+                 << '\n';
+
             std::cout << name << " hybrid_kernel_ms=" << r.hybridKernelMs
-                      << " speedup_vs_seq=" << r.speedupHybridVsSeq << '\n';
+                      << " speedup_vs_seq=" << r.speedupHybridVsSeq
+                      << " convert_hidden_ms=" << convertHidden
+                      << " hybrid_unexplained_ms=" << hybridUnexplained
+                      << " pad_ratio=" << pad
+                      << " assign_gbs=" << assignGbs << '\n';
         }
         std::cout << "Wrote " << outCsv << '\n';
+        std::cout << "Wrote " << diagCsv << '\n';
+
+        std::ofstream scale(scaleCsv);
+        scale << "matrix,omp_threads,convert_ms,speedup_vs_1thread\n";
+        std::cout << "\nOpenMP conversion thread sweep (memory-bound test)\n";
+        const int sweepThreads[] = {1, 2, 4, 8};
+        for (const std::string& focus : {"U3", "U4", "I3", "I4"}) {
+            const auto path = matrixDir / (focus + ".csrbin");
+            if (!std::filesystem::exists(path)) continue;
+            const auto csr = loadBinary(path);
+            double t1 = 0.0;
+            for (int th : sweepThreads) {
+                std::vector<double> samples;
+                for (int i = 0; i < kConversionRuns; ++i) {
+                    const auto t0 = Clock::now();
+                    (void)hybrid_cpu_gpu::convertCsrToArgCsrOpenMP(csr, kDesired, kBlock, th);
+                    samples.push_back(ms(Clock::now() - t0));
+                }
+                const double med = median(samples);
+                if (th == 1) t1 = med;
+                const double vs1 = (t1 > 0.0) ? t1 / med : 0.0;
+                scale << focus << ',' << th << ',' << std::setprecision(10) << med << ',' << vs1 << '\n';
+                std::cout << focus << " threads=" << th << " convert_ms=" << med
+                          << " vs_1thread=" << vs1 << '\n';
+            }
+        }
+        std::cout << "Wrote " << scaleCsv << '\n';
     } catch (const std::exception& e) {
         std::cerr << "four_way_benchmark failed: " << e.what() << '\n';
         return 1;
